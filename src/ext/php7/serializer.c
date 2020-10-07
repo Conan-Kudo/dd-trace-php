@@ -9,6 +9,7 @@
 #include "arrays.h"
 #include "compat_string.h"
 #include "ddtrace.h"
+#include "engine_api.h"
 #include "logging.h"
 #include "mpack/mpack.h"
 #include "span.h"
@@ -196,7 +197,7 @@ static void _trace_string(smart_str *str, HashTable *ht, uint32_t num) /* {{{ */
 /* Modelled after getTraceAsString from PHP 5.4:
  * @see https://lxr.room11.org/xref/php-src%405.4/Zend/zend_exceptions.c#609-635
  */
-static void _serialize_stack_trace(zval *meta, zval *trace) {
+static zval dd_serialize_stack_trace(zval *trace) {
     zval *frame, output;
     smart_str str = {0};
     uint32_t num = 0;
@@ -217,73 +218,108 @@ static void _serialize_stack_trace(zval *meta, zval *trace) {
     smart_str_0(&str);
 
     ZVAL_NEW_STR(&output, str.s);
-
-    add_assoc_zval(meta, "error.stack", &output);
+    return output;
 }
 
-static void dd_serialize_exception(zval *el, zval *meta, zend_object *exception_obj) {
-    zval exception, name, msg, code, stack;
-    if (!exception_obj) {
-        return;
+static int dd_exception_to_error_msg(zend_object *exception, void *context,
+                                     int (*add_tag)(void *context, ddtrace_string key, ddtrace_string value)) {
+    zval msg = ddtrace_zval_undef();
+    int status = ddtrace_call_method(exception, exception->ce, NULL, ZEND_STRL("getmessage"), &msg, 0, NULL);
+
+    if (status == SUCCESS && Z_TYPE(msg) == IS_STRING) {
+        ddtrace_string key = DDTRACE_STRING_LITERAL("error.msg");
+        ddtrace_string value = {Z_STRVAL(msg), Z_STRLEN(msg)};
+        status = add_tag(context, key, value);
+    } else {
+        ddtrace_assert_log_debug("Failed calling exception's getMessage()");
     }
 
-    ZVAL_OBJ(&exception, exception_obj);
+    zval_ptr_dtor(&msg);
+    return status;
+}
 
-    add_assoc_long(el, "error", 1);
+static int dd_exception_to_error_type(zend_object *exception, void *context,
+                                      int (*add_tag)(void *context, ddtrace_string key, ddtrace_string value)) {
+    ddtrace_string value, key = DDTRACE_STRING_LITERAL("error.type");
 
-    ZVAL_STR(&name, Z_OBJCE(exception)->name);
-#if PHP_VERSION_ID < 80000
-    zend_call_method_with_0_params(&exception, Z_OBJCE(exception), NULL, "getmessage", &msg);
-#else
-    zend_call_method_with_0_params(exception_obj, Z_OBJCE(exception), NULL, "getmessage", &msg);
-#endif
+    if (instanceof_function(exception->ce, ddtrace_ce_fatal_error)) {
+        zval code = ddtrace_zval_undef();
+        int status = ddtrace_call_method(exception, exception->ce, NULL, ZEND_STRL("getcode"), &code, 0, NULL);
+        const char *error_type_string = "{unknown error}";
 
-    if (instanceof_function(Z_OBJCE(exception), ddtrace_ce_fatal_error)) {
-#if PHP_VERSION_ID < 80000
-        zend_call_method_with_0_params(&exception, Z_OBJCE(exception), NULL, "getcode", &code);
-#else
-        zend_call_method_with_0_params(exception_obj, Z_OBJCE(exception), NULL, "getcode", &code);
-#endif
-        if (Z_TYPE_INFO(code) == IS_LONG) {
+        if (status == SUCCESS && Z_TYPE_INFO(code) == IS_LONG) {
             switch (Z_LVAL(code)) {
                 case E_ERROR:
-                    add_assoc_string(meta, "error.type", "E_ERROR");
+                    error_type_string = "E_ERROR";
                     break;
                 case E_CORE_ERROR:
-                    add_assoc_string(meta, "error.type", "E_CORE_ERROR");
+                    error_type_string = "E_CORE_ERROR";
                     break;
                 case E_COMPILE_ERROR:
-                    add_assoc_string(meta, "error.type", "E_COMPILE_ERROR");
+                    error_type_string = "E_COMPILE_ERROR";
                     break;
                 case E_USER_ERROR:
-                    add_assoc_string(meta, "error.type", "E_USER_ERROR");
+                    error_type_string = "E_USER_ERROR";
                     break;
                 default:
-                    ZEND_ASSERT(0 && "Unhandled error type in DDTrace\\FatalError; is a fatal error case missing?");
-                    add_assoc_string(meta, "error.type", "{unknown error}");
-                    break;
+                    ddtrace_assert_log_debug(
+                        "Unhandled error type in DDTrace\\FatalError; is a fatal error case missing?");
             }
+
         } else {
-            ddtrace_log_debug("Exception was a DDTrace\\FatalError but exception code was not an int");
+            ddtrace_assert_log_debug("Exception was a DDTrace\\FatalError but failed to get an exception code");
         }
+
         zval_ptr_dtor(&code);
+        value = ddtrace_string_cstring_ctor((char *)error_type_string);
+
     } else {
-        _add_assoc_zval_copy(meta, "error.type", &name);
+        zend_string *type_name = exception->ce->name;
+        value.ptr = ZSTR_VAL(type_name);
+        value.len = ZSTR_LEN(type_name);
     }
 
-    add_assoc_zval(meta, "error.msg", &msg);
+    return add_tag(context, key, value);
+}
+
+static int dd_exception_to_error_stack(zend_object *exception, void *context,
+                                       int (*add_tag)(void *context, ddtrace_string key, ddtrace_string value)) {
+    zval stack = ddtrace_zval_undef(), error_stack = ddtrace_zval_undef();
 
     /* Note, we use Exception::getTrace() instead of getTraceAsString because
      * function arguments can contain sensitive information. Since we do not
      * have a comprehensive way to know which function arguments are sensitive
      * we will just hide all of them. */
-#if PHP_VERSION_ID < 80000
-    zend_call_method_with_0_params(&exception, Z_OBJCE(exception), NULL, "gettrace", &stack);
-#else
-    zend_call_method_with_0_params(exception_obj, Z_OBJCE(exception), NULL, "gettrace", &stack);
-#endif
-    _serialize_stack_trace(meta, &stack);
+    int result = ddtrace_call_method(exception, exception->ce, NULL, ZEND_STRL("gettrace"), &stack, 0, NULL);
+    if (result == SUCCESS && Z_TYPE(stack) == IS_ARRAY) {
+        error_stack = dd_serialize_stack_trace(&stack);
+        if (Z_TYPE(error_stack) == IS_STRING) {
+            ddtrace_string key = DDTRACE_STRING_LITERAL("error.stack");
+            ddtrace_string value = {Z_STRVAL(error_stack), Z_STRLEN(error_stack)};
+            result = add_tag(context, key, value);
+        }
+    } else {
+        ddtrace_assert_log_debug("Failed calling exception's getTrace()");
+    }
+
+    zval_ptr_dtor(&error_stack);
     zval_ptr_dtor(&stack);
+    return result;
+}
+
+int ddtrace_exception_to_meta(zend_object *exception, void *context,
+                              int (*add_meta)(void *context, ddtrace_string key, ddtrace_string value)) {
+    bool success = dd_exception_to_error_msg(exception, context, add_meta) == SUCCESS &&
+                   dd_exception_to_error_type(exception, context, add_meta) == SUCCESS &&
+                   dd_exception_to_error_stack(exception, context, add_meta) == SUCCESS;
+    return success ? SUCCESS : FAILURE;
+}
+
+static int dd_add_meta_array(void *context, ddtrace_string key, ddtrace_string value) {
+    zval *meta = context, tmp = ddtrace_zval_stringl(value.ptr, value.len);
+
+    // meta array takes ownership of tmp
+    return add_assoc_zval_ex(meta, key.ptr, key.len, &tmp);
 }
 
 static void _serialize_meta(zval *el, ddtrace_span_fci *span_fci) {
@@ -304,13 +340,15 @@ static void _serialize_meta(zval *el, ddtrace_span_fci *span_fci) {
     }
     meta = &meta_zv;
 
-    dd_serialize_exception(el, meta, span_fci->exception);
-    if (!span_fci->exception) {
-        zval *error = ddtrace_hash_find_ptr(Z_ARR_P(meta), ZEND_STRL("error.msg"));
-        if (error) {
-            add_assoc_long(el, "error", 1);
-        }
+    if (span_fci->exception) {
+        ddtrace_exception_to_meta(span_fci->exception, meta, dd_add_meta_array);
     }
+
+    zval *error = ddtrace_hash_find_ptr(Z_ARR_P(meta), ZEND_STRL("error.msg"));
+    if (error) {
+        add_assoc_long(el, "error", 1);
+    }
+
     if (span->parent_id == 0) {
         char pid[MAX_LENGTH_OF_LONG + 1];
         snprintf(pid, sizeof(pid), "%ld", (long)span->pid);

@@ -249,6 +249,12 @@ static void _serialize_stack_trace(zval *meta, zval *trace TSRMLS_DC) {
     add_assoc_string(meta, "error.stack", res, 0);
 }
 
+int ddtrace_exception_to_meta(ddtrace_exception_t *exception, void *context,
+                              int (*add_tag)(void *context, ddtrace_string key, ddtrace_string value)) {
+    UNUSED(exception, context, add_tag);
+    return SUCCESS;
+}
+
 static void dd_serialize_exception(zval *el, zval *meta, ddtrace_exception_t *exception TSRMLS_DC) {
     zend_uint class_name_len;
     const char *class_name;
