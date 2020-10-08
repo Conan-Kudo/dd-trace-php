@@ -9,6 +9,7 @@
 #include "compat_string.h"
 #include "compatibility.h"
 #include "ddtrace.h"
+#include "engine_hooks.h"
 #include "logging.h"
 #include "mpack/mpack.h"
 #include "span.h"
@@ -430,4 +431,29 @@ void ddtrace_serialize_span_to_array(ddtrace_span_fci *span_fci, zval *array TSR
     }
 
     add_next_index_zval(array, el);
+}
+
+void ddtrace_error_cb(DDTRACE_ERROR_CB_PARAMETERS) {
+    TSRMLS_FETCH();
+
+    /* We need the error handling to place nicely with the sandbox. The best
+     * idea so far is to execute fatal error handling code iff the error handling
+     * mode is set to EH_NORMAL. If it's something else, such as EH_SUPPRESS or
+     * EH_THROW, then they are likely to be handled and accordingly they
+     * shouldn't be treated as fatal.
+     */
+
+    bool is_fatal_error = type & (E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR);
+    if (EXPECTED(EG(active)) && EG(error_handling) == EH_NORMAL && UNEXPECTED(is_fatal_error)) {
+        ddtrace_exception_t *error = ddtrace_make_exception_from_error(DDTRACE_ERROR_CB_PARAM_PASSTHRU TSRMLS_CC);
+        ddtrace_span_fci *span = DDTRACE_G(open_spans_top);
+        while (span) {
+            ddtrace_span_attach_exception(span, error);
+            span = span->next;
+        }
+        zval_ptr_dtor(&error);
+        ddtrace_close_all_open_spans(TSRMLS_C);
+    }
+
+    ddtrace_prev_error_cb(DDTRACE_ERROR_CB_PARAM_PASSTHRU);
 }

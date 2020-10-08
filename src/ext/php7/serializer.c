@@ -10,6 +10,7 @@
 #include "compat_string.h"
 #include "ddtrace.h"
 #include "engine_api.h"
+#include "engine_hooks.h"
 #include "logging.h"
 #include "mpack/mpack.h"
 #include "span.h"
@@ -425,3 +426,53 @@ void ddtrace_serialize_span_to_array(ddtrace_span_fci *span_fci, zval *array TSR
 
     add_next_index_zval(array, el);
 }
+
+#if PHP_VERSION_ID < 80000
+void ddtrace_error_cb(DDTRACE_ERROR_CB_PARAMETERS) {
+    /* We need the error handling to place nicely with the sandbox. The best
+     * idea so far is to execute fatal error handling code iff the error handling
+     * mode is set to EH_NORMAL. If it's something else, such as EH_SUPPRESS or
+     * EH_THROW, then they are likely to be handled and accordingly they
+     * shouldn't be treated as fatal.
+     */
+    bool is_fatal_error = type & (E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR);
+    if (EXPECTED(EG(active)) && EG(error_handling) == EH_NORMAL && UNEXPECTED(is_fatal_error)) {
+        ddtrace_exception_t *error = ddtrace_make_exception_from_error(DDTRACE_ERROR_CB_PARAM_PASSTHRU);
+        ddtrace_span_fci *span = DDTRACE_G(open_spans_top);
+        while (span) {
+            ddtrace_span_attach_exception(span, error);
+            span = span->next;
+        }
+        ddtrace_close_all_open_spans();
+        zend_object_release(error);
+    }
+
+    ddtrace_prev_error_cb(DDTRACE_ERROR_CB_PARAM_PASSTHRU);
+}
+#else
+void ddtrace_observer_error_cb(int type, const char *error_filename, uint32_t error_lineno, zend_string *message) {
+    UNUSED(error_filename, error_lineno);
+
+    bool is_fatal_error = type & (E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR);
+    if (EXPECTED(EG(active)) && EG(error_handling) == EH_NORMAL && UNEXPECTED(is_fatal_error)) {
+        zval ex, tmp;
+        object_init_ex(&ex, ddtrace_ce_fatal_error);
+        zend_object *error = Z_OBJ(ex);
+
+        ZVAL_STR(&tmp, message);
+        zend_update_property(ddtrace_ce_fatal_error, error, ZEND_STRL("message"), &tmp);
+        zval_ptr_dtor(&tmp);
+
+        ZVAL_LONG(&tmp, (zend_long)type);
+        zend_update_property(ddtrace_ce_fatal_error, error, ZEND_STRL("code"), &tmp);
+
+        ddtrace_span_fci *span = DDTRACE_G(open_spans_top);
+        while (span) {
+            ddtrace_span_attach_exception(span, error);
+            span = span->next;
+        }
+        ddtrace_close_all_open_spans();
+        zend_object_release(error);
+    }
+}
+#endif
