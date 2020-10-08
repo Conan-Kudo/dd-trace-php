@@ -438,6 +438,7 @@ void ddtrace_error_cb(DDTRACE_ERROR_CB_PARAMETERS) {
     bool is_fatal_error = type & (E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR);
     if (EXPECTED(EG(active)) && EG(error_handling) == EH_NORMAL && UNEXPECTED(is_fatal_error)) {
         ddtrace_exception_t *error = ddtrace_make_exception_from_error(DDTRACE_ERROR_CB_PARAM_PASSTHRU);
+        ddtrace_exception_to_meta(error, &DDTRACE_G(additional_trace_meta), dd_add_meta_array);
         ddtrace_span_fci *span = DDTRACE_G(open_spans_top);
         while (span) {
             ddtrace_span_attach_exception(span, error);
@@ -466,6 +467,7 @@ void ddtrace_observer_error_cb(int type, const char *error_filename, uint32_t er
         ZVAL_LONG(&tmp, (zend_long)type);
         zend_update_property(ddtrace_ce_fatal_error, error, ZEND_STRL("code"), &tmp);
 
+        ddtrace_exception_to_meta(error, &DDTRACE_G(additional_trace_meta), dd_add_meta_array);
         ddtrace_span_fci *span = DDTRACE_G(open_spans_top);
         while (span) {
             ddtrace_span_attach_exception(span, error);

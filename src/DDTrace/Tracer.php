@@ -357,6 +357,13 @@ final class Tracer implements TracerInterface
         $autoFinishSpans = \ddtrace_config_autofinish_span_enabled();
         $serviceMappings = \ddtrace_config_service_mapping();
 
+        $root = $this->getSafeRootSpan();
+        if ($root && \function_exists('DDTrace\\additional_span_meta')) {
+            foreach (\DDTrace\additional_span_meta() as $tag => $value) {
+                $root->setTag($tag, $value);
+            }
+        }
+
         foreach ($this->traces as $trace) {
             $traceToBeSent = [];
             foreach ($trace as $span) {
