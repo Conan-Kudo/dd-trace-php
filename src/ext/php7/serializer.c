@@ -319,7 +319,7 @@ static int dd_add_meta_array(void *context, ddtrace_string key, ddtrace_string v
     zval *meta = context, tmp = ddtrace_zval_stringl(value.ptr, value.len);
 
     // meta array takes ownership of tmp
-    return add_assoc_zval_ex(meta, key.ptr, key.len, &tmp);
+    return zend_symtable_str_update(Z_ARR_P(meta), key.ptr, key.len, &tmp) != NULL ? SUCCESS : FAILURE;
 }
 
 static void _serialize_meta(zval *el, ddtrace_span_fci *span_fci) {
